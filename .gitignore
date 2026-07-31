@@ -1,0 +1,6 @@
+.venv/
+pkp-monitor-linux-amd64
+*.log
+state.json
+__pycache__/
+.DS_Store
