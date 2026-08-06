@@ -130,13 +130,16 @@ def parse_wagon_seats(svg_text):
         row = sorted((o for o in seats if o["side"] == s["side"] and o["y"] == s["y"]),
                      key=lambda o: o["x"])
         i = row.index(s)
-        s["facing"] = False
+        s["faces"] = None  # numer miejsca naprzeciwko (przez stolik), jeśli jest
         if s["ori"] == "R" and i + 1 < len(row):
             nxt = row[i + 1]
-            s["facing"] = nxt["ori"] == "L" and nxt["x"] - s["x"] <= 120
+            if nxt["ori"] == "L" and nxt["x"] - s["x"] <= 120:
+                s["faces"] = nxt["nr"]
         elif s["ori"] == "L" and i > 0:
             prv = row[i - 1]
-            s["facing"] = prv["ori"] == "R" and s["x"] - prv["x"] <= 120
+            if prv["ori"] == "R" and s["x"] - prv["x"] <= 120:
+                s["faces"] = prv["nr"]
+        s["facing"] = s["faces"] is not None
     return seats
 
 
@@ -205,19 +208,50 @@ def parse_miejsca(spec):
     return out
 
 
-def find_pairs(pool):
-    """Grupy wolnych miejsc siedzących obok siebie (ta sama kolumna foteli:
-    to samo x po tej samej stronie przejścia = okno + korytarz).
-    Zwraca listę [(wagon, [miejsca...]), ...] dla grup >= 2 miejsc."""
+def find_pairs(pool, styl="dowolny"):
+    """Pary wolnych miejsc dla dwóch osób. Zwraca [(wagon, [miejsca], opis), ...].
+
+    Rozpoznawane układy:
+      * obok siebie  — ta sama kolumna foteli (to samo x po tej samej stronie
+        przejścia = okno + korytarz); dodatkowo wiemy, czy jest przy stoliku,
+      * przez stolik — dwa miejsca POJEDYNCZE (bez sąsiada obok) zwrócone
+        do siebie przodem, czyli klasyczne "dwójka przy stoliku".
+
+    styl: dowolny | obok-bez-stolika | pojedyncze-stolik | preferowany
+    """
+    out = []
     groups = {}
     for w, s in pool:
         groups.setdefault((w["nr"], s["side"], s["x"]), (w, []))[1].append(s)
-    out = [(w, seats) for (wn, side, x), (w, seats) in groups.items() if len(seats) >= 2]
-    return sorted(out, key=lambda p: (p[0]["nr"], p[1][0]["y"]))
+    for (_wn, _side, _x), (w, seats) in groups.items():
+        if len(seats) < 2:
+            continue
+        bez_stolika = not any(s["facing"] for s in seats)
+        if styl == "dowolny" or (styl in ("obok-bez-stolika", "preferowany") and bez_stolika):
+            out.append((w, sorted(seats, key=lambda o: o["y"]),
+                        "obok siebie, bez stolika" if bez_stolika else "obok siebie, przy stoliku"))
+
+    if styl in ("pojedyncze-stolik", "preferowany"):
+        wagons = {}
+        for w, s in pool:
+            wagons.setdefault(w["nr"], (w, {}))[1][s["nr"]] = s
+        seen = set()
+        for wn, (w, free) in wagons.items():
+            for nr, s in free.items():
+                partner = free.get(s["faces"] or "")
+                # oba muszą być pojedyncze i zwrócone do siebie nawzajem
+                if not (s["single"] and partner and partner["single"] and partner["faces"] == nr):
+                    continue
+                key = (wn, frozenset((nr, partner["nr"])))
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append((w, [s, partner], "pojedyncze przez stolik"))
+    return sorted(out, key=lambda p: (p[0]["nr"], p[1][0]["y"], p[1][0]["x"]))
 
 
 def summarize(wagons, skipped, klasa, wagon_want, single_only=False, wishlist=None,
-              pairs_only=False):
+              pairs_only=False, styl="dowolny"):
     """Zwraca (liczba miejsc wyzwalających powiadomienie, tekst podsumowania)."""
     total, parts = 0, []
     for cls in ("1", "2") if klasa == "any" else (klasa,):
@@ -228,16 +262,18 @@ def summarize(wagons, skipped, klasa, wagon_want, single_only=False, wishlist=No
             spec += w[f"kl{cls}_spec"]
             pool += [(w, s) for s in w[f"kl{cls}"]]
         if pairs_only:
-            pairs = find_pairs(pool)
+            pairs = find_pairs(pool, styl)
             total += len(pairs)
-            s_txt = f"kl.{cls} pary obok siebie: {len(pairs)}"
+            etykieta = "pary dla dwóch osób" if styl != "dowolny" else "pary obok siebie"
+            s_txt = f"kl.{cls} {etykieta}: {len(pairs)}"
             if pairs:
                 s_txt += " — " + ", ".join(
-                    f"wag.{w['nr']}: {'+'.join(s['nr'] for s in sorted(seats, key=lambda o: o['y']))}"
-                    for w, seats in pairs[:6]) + ("…" if len(pairs) > 6 else "")
-            singles = len(pool) - sum(len(seats) for _, seats in pairs)
+                    f"wag.{w['nr']}: {'+'.join(s['nr'] for s in seats)}"
+                    + (f" ({opis})" if styl != "dowolny" else "")
+                    for w, seats, opis in pairs[:6]) + ("…" if len(pairs) > 6 else "")
+            singles = len(pool) - sum(len(seats) for _, seats, _ in pairs)
             if singles:
-                s_txt += f"; pojedynczych wolnych: {singles}"
+                s_txt += f"; innych wolnych: {singles}"
             if spec:
                 s_txt += f" (+{spec} spec.)"
             parts.append(s_txt)
@@ -340,8 +376,12 @@ def main():
                    help="powiadamiaj tylko o miejscach pojedynczych (bez sąsiada obok); "
                         "w raporcie rozdzielone na bez stolika / ze stolikiem (vis-à-vis)")
     p.add_argument("--para", action="store_true",
-                   help="powiadamiaj tylko gdy są dwa wolne miejsca obok siebie "
-                        "(ta sama kolumna foteli: okno + korytarz)")
+                   help="powiadamiaj tylko gdy są dwa wolne miejsca dla dwóch osób razem")
+    p.add_argument("--styl", choices=["dowolny", "obok-bez-stolika", "pojedyncze-stolik",
+                                      "preferowany"], default="dowolny",
+                   help="jakie układy pary akceptujesz (z --para): dowolny = każde dwa obok "
+                        "siebie; obok-bez-stolika; pojedyncze-stolik = dwa miejsca pojedyncze "
+                        "naprzeciw siebie przez stolik; preferowany = dwa ostatnie razem")
     p.add_argument("--miejsca", default=None, metavar="LISTA",
                    help='powiadamiaj tylko o konkretnych miejscach, per wagon: "1:16,26,31;2:16,46" '
                         "(ma pierwszeństwo przed --pojedyncze)")
@@ -393,7 +433,7 @@ def main():
     state_key = (f"{from_name}|{to_name}|{args.date}|{args.klasa}|{args.wagon}"
                  + f"|{args.after}-{args.before}"
                  + ("|pojedyncze" if args.pojedyncze else "")
-                 + ("|para" if args.para else "")
+                 + (f"|para-{args.styl}" if args.para else "")
                  + (f"|miejsca={args.miejsca}" if args.miejsca else ""))
     saved_state, last_counts = {}, {}
     if args.state and os.path.exists(args.state):
@@ -437,7 +477,7 @@ def main():
                 wagons, skipped = check_seats(train, from_e, to_e)
                 free, summary = summarize(wagons, skipped, args.klasa, args.wagon,
                                           single_only=args.pojedyncze, wishlist=wishlist,
-                                          pairs_only=args.para)
+                                          pairs_only=args.para, styl=args.styl)
                 print(f"[{stamp}] {desc}: {summary}")
                 if free > 0 and not last_counts.get(nr):
                     newly.append((desc, summary))
