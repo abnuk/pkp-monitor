@@ -26,6 +26,7 @@ Przykłady:
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -191,7 +192,7 @@ def _by_wagon(pairs):
     grouped = {}
     for w, s in pairs:
         grouped.setdefault(w["nr"], []).append(s["nr"])
-    return "; ".join(f"wag.{wn}: nr {','.join(nrs[:6])}" + ("…" if len(nrs) > 6 else "")
+    return ", ".join(f"wag.{wn}: nr {','.join(nrs[:6])}" + ("…" if len(nrs) > 6 else "")
                      for wn, nrs in grouped.items())
 
 
@@ -204,7 +205,19 @@ def parse_miejsca(spec):
     return out
 
 
-def summarize(wagons, skipped, klasa, wagon_want, single_only=False, wishlist=None):
+def find_pairs(pool):
+    """Grupy wolnych miejsc siedzących obok siebie (ta sama kolumna foteli:
+    to samo x po tej samej stronie przejścia = okno + korytarz).
+    Zwraca listę [(wagon, [miejsca...]), ...] dla grup >= 2 miejsc."""
+    groups = {}
+    for w, s in pool:
+        groups.setdefault((w["nr"], s["side"], s["x"]), (w, []))[1].append(s)
+    out = [(w, seats) for (wn, side, x), (w, seats) in groups.items() if len(seats) >= 2]
+    return sorted(out, key=lambda p: (p[0]["nr"], p[1][0]["y"]))
+
+
+def summarize(wagons, skipped, klasa, wagon_want, single_only=False, wishlist=None,
+              pairs_only=False):
     """Zwraca (liczba miejsc wyzwalających powiadomienie, tekst podsumowania)."""
     total, parts = 0, []
     for cls in ("1", "2") if klasa == "any" else (klasa,):
@@ -214,6 +227,21 @@ def summarize(wagons, skipped, klasa, wagon_want, single_only=False, wishlist=No
                 continue
             spec += w[f"kl{cls}_spec"]
             pool += [(w, s) for s in w[f"kl{cls}"]]
+        if pairs_only:
+            pairs = find_pairs(pool)
+            total += len(pairs)
+            s_txt = f"kl.{cls} pary obok siebie: {len(pairs)}"
+            if pairs:
+                s_txt += " — " + ", ".join(
+                    f"wag.{w['nr']}: {'+'.join(s['nr'] for s in sorted(seats, key=lambda o: o['y']))}"
+                    for w, seats in pairs[:6]) + ("…" if len(pairs) > 6 else "")
+            singles = len(pool) - sum(len(seats) for _, seats in pairs)
+            if singles:
+                s_txt += f"; pojedynczych wolnych: {singles}"
+            if spec:
+                s_txt += f" (+{spec} spec.)"
+            parts.append(s_txt)
+            continue
         if wishlist:
             wanted = [(w, s) for w, s in pool if s["nr"] in wishlist.get(w["nr"], set())]
             total += len(wanted)
@@ -253,10 +281,33 @@ def summarize(wagons, skipped, klasa, wagon_want, single_only=False, wishlist=No
     return total, "; ".join(parts)
 
 
+NTFY_LIMIT = 1200  # ntfy przyjmuje ~4 kB; i tak nikt nie czyta dłuższego pusha
+
+
+def format_push(date_iso, entries):
+    """Wielolinijkowa treść pusha. Markdown odpada — aplikacje mobilne ntfy
+    renderują tylko czysty tekst (gwiazdki byłyby widoczne dosłownie),
+    więc czytelność robimy nowymi liniami, wcięciami i emoji."""
+    lines = [f"📅 {date_iso}"]
+    for desc, summary in entries:
+        lines.append(f"🚆 {desc}")
+        for part in summary.split("; "):
+            part = part.strip()
+            # pomijamy linie typu "kl.1 pary obok siebie: 0" — w powiadomieniu
+            # o wolnych miejscach zera to sam szum
+            if not part or ("—" not in part and re.search(r":\s*0\b", part)):
+                continue
+            lines.append(f"   • {part}")
+    return "\n".join(lines)
+
+
 def notify(title, message, ntfy_topic=None):
     """Powiadomienie systemowe macOS + dźwięk + opcjonalnie push przez ntfy.sh."""
+    if len(message) > NTFY_LIMIT:
+        message = message[:NTFY_LIMIT].rsplit("\n", 1)[0] + "\n… (całość w logu)"
     try:
-        msg = message.replace('"', "'")
+        # w AppleScript nowa linia w literale to \n, surowy znak łamie składnię
+        msg = message.replace('"', "'").replace("\n", "\\n")
         subprocess.run(["osascript", "-e",
                         f'display notification "{msg}" with title "{title}" sound name "Glass"'],
                        check=False)
@@ -288,6 +339,9 @@ def main():
     p.add_argument("--pojedyncze", action="store_true",
                    help="powiadamiaj tylko o miejscach pojedynczych (bez sąsiada obok); "
                         "w raporcie rozdzielone na bez stolika / ze stolikiem (vis-à-vis)")
+    p.add_argument("--para", action="store_true",
+                   help="powiadamiaj tylko gdy są dwa wolne miejsca obok siebie "
+                        "(ta sama kolumna foteli: okno + korytarz)")
     p.add_argument("--miejsca", default=None, metavar="LISTA",
                    help='powiadamiaj tylko o konkretnych miejscach, per wagon: "1:16,26,31;2:16,46" '
                         "(ma pierwszeństwo przed --pojedyncze)")
@@ -337,7 +391,9 @@ def main():
     # nr pociągu -> ostatnia liczba zwykłych wolnych miejsc (po filtrach)
     wishlist = parse_miejsca(args.miejsca) if args.miejsca else None
     state_key = (f"{from_name}|{to_name}|{args.date}|{args.klasa}|{args.wagon}"
+                 + f"|{args.after}-{args.before}"
                  + ("|pojedyncze" if args.pojedyncze else "")
+                 + ("|para" if args.para else "")
                  + (f"|miejsca={args.miejsca}" if args.miejsca else ""))
     saved_state, last_counts = {}, {}
     if args.state and os.path.exists(args.state):
@@ -351,6 +407,16 @@ def main():
         stamp = datetime.now().strftime("%H:%M:%S")
         try:
             found = search_trains(args.date, from_h, to_h)
+            if not found:
+                # API czasem oddaje 200 z pustą listą (przycięcie/chwilowa awaria).
+                # Nie nadpisujemy wtedy stanu — inaczej po powrocie danych wszystkie
+                # pociągi wyglądałyby na "nowe" i poszłoby fałszywe powiadomienie.
+                print(f"[{stamp}] API nie zwróciło żadnych połączeń — pomijam ten cykl "
+                      "(stan bez zmian)")
+                if args.once:
+                    break
+                time.sleep(args.interval)
+                continue
             matched = []
             for train in found:
                 dep_time = train["dataWyjazdu"][11:16]
@@ -370,14 +436,15 @@ def main():
                         f" {(t.get('nazwaPociagu') or '').strip()}".rstrip())
                 wagons, skipped = check_seats(train, from_e, to_e)
                 free, summary = summarize(wagons, skipped, args.klasa, args.wagon,
-                                          single_only=args.pojedyncze, wishlist=wishlist)
+                                          single_only=args.pojedyncze, wishlist=wishlist,
+                                          pairs_only=args.para)
                 print(f"[{stamp}] {desc}: {summary}")
                 if free > 0 and not last_counts.get(nr):
-                    newly.append(f"{desc}: {summary}")
+                    newly.append((desc, summary))
                 last_counts[nr] = free
             if newly:
                 notify("PKP Intercity — są miejsca siedzące!",
-                       f"{args.date}: " + " | ".join(newly), args.ntfy)
+                       format_push(args.date, newly), args.ntfy)
             if args.state:
                 saved_state[state_key] = last_counts
                 with open(args.state, "w") as f:
