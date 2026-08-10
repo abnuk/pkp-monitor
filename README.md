@@ -15,6 +15,12 @@ które widać przy graficznym wyborze miejsca na intercity.pl.
 - rozpoznaje z geometrii mapy **miejsca pojedyncze** — bez sąsiada obok —
   i rozdziela je na „bez stolika" (nikt nie siedzi naprzeciwko) oraz
   „ze stolikiem" (vis-à-vis): `--pojedyncze`,
+- znajduje **miejsca dla dwóch osób razem** (`--para`) z rozróżnieniem układu
+  (`--styl`): `obok-bez-stolika`, `pojedyncze-stolik` (dwa pojedyncze naprzeciw
+  siebie przez stolik), `preferowany` (oba naraz) albo `dowolny`,
+- **zagęszcza sprawdzanie przed odjazdem** (`--adaptacyjnie`): >48 h co 15 min,
+  <48 h co 10 min, <24 h co 5 min, <3 h co 2 min — bo zwolnione miejsce
+  w popularnym pociągu potrafi zniknąć w kilka minut,
 - umie pilnować **konkretnych numerów miejsc** per wagon:
   `--miejsca "1:16,26,31;2:16,46"`,
 - powiadamia natywnie na macOS (dymek + dźwięk) oraz **push na telefon** przez
@@ -90,6 +96,15 @@ Pod crona używaj `--once` z `--state`, żeby stan przeżywał między uruchomie
 
 ```cron
 */15 * * * * /home/user/pkp-monitor/pkp-monitor --from Dzialdowo --to "Warszawa Wschodnia" --date 2026-08-02 --train 5122 --ntfy TEMAT --state /home/user/pkp-monitor/state.json --once >> /home/user/pkp-monitor/monitor.log 2>&1
+```
+
+Z `--adaptacyjnie` wpis ustawiasz na **co minutę** — skrypt sam decyduje, czy
+cykl jest już należny, na podstawie godziny odjazdu zapamiętanej w pliku stanu.
+Pominięty cykl kończy się w ułamku sekundy, nie odpytuje API i nie zapisuje nic
+do logu:
+
+```cron
+* * * * * /home/user/pkp-monitor/pkp-monitor --from ... --adaptacyjnie --state /home/user/pkp-monitor/state.json --once >> /home/user/pkp-monitor/monitor.log 2>&1
 ```
 
 Samodzielną binarkę na Linuksa (bez instalowania Pythona i zależności na

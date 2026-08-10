@@ -31,7 +31,7 @@ import subprocess
 import sys
 import time
 import xml.etree.ElementTree as ET
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 
 from curl_cffi import requests
 
@@ -197,6 +197,29 @@ def _by_wagon(pairs):
         grouped.setdefault(w["nr"], []).append(s["nr"])
     return ", ".join(f"wag.{wn}: nr {','.join(nrs[:6])}" + ("…" if len(nrs) > 6 else "")
                      for wn, nrs in grouped.items())
+
+
+def interval_for(departure_dt, now):
+    """Im bliżej odjazdu, tym częściej sprawdzamy — dobre miejsca z odwołanych
+    rezerwacji potrafią zniknąć w kilka minut."""
+    hours = (departure_dt - now).total_seconds() / 3600
+    if hours <= 3:
+        return 120
+    if hours <= 24:
+        return 300
+    if hours <= 48:
+        return 600
+    return 900
+
+
+def pauza_do_nastepnego(args, meta):
+    """Ile spać w trybie pętli (w cronie nieużywane — tam decyduje --adaptacyjnie)."""
+    now = datetime.now()
+    przyszle = sorted(d for d in (meta.get("departures") or [])
+                      if datetime.fromisoformat(d) > now)
+    if args.adaptacyjnie and przyszle:
+        return interval_for(datetime.fromisoformat(przyszle[0]), now)
+    return args.interval
 
 
 def parse_miejsca(spec):
@@ -388,6 +411,11 @@ def main():
     p.add_argument("--ntfy", default=None, metavar="TEMAT",
                    help="wyślij też push przez ntfy.sh na ten temat (appka ntfy na iOS)")
     p.add_argument("--interval", type=int, default=300, help="co ile sekund sprawdzać (domyślnie 300)")
+    p.add_argument("--adaptacyjnie", action="store_true",
+                   help="zagęszczaj sprawdzanie w miarę zbliżania się odjazdu: >48 h co 15 min, "
+                        "<48 h co 10 min, <24 h co 5 min, <3 h co 2 min. Pod cronem uruchamiaj "
+                        "co minutę z --once i --state — skrypt sam pomija cykle, które nie są "
+                        "jeszcze należne (bez zapytań do API)")
     p.add_argument("--once", action="store_true", help="sprawdź raz i zakończ")
     p.add_argument("--dump-wagon", default=None, metavar="NR",
                    help="(diagnostyka) wypisz surowe SVG mapy wagonu NR pierwszego pasującego pociągu i zakończ")
@@ -401,6 +429,42 @@ def main():
         print(f"Data {args.date} już minęła — nic do monitorowania, kończę. "
               "(Usuń wpis z crona, jeśli to on mnie uruchamia.)")
         return
+
+    # Bramka adaptacyjna musi zadziałać PRZED odpytaniem o stacje i przed
+    # nagłówkiem — inaczej pominięty cykl i tak kosztowałby dwa zapytania
+    # i zaśmiecał log. Dlatego klucz liczymy z surowych argumentów.
+    gate_key = "|".join(str(x) for x in (
+        args.src, args.dst, args.date, args.train, args.klasa, args.wagon,
+        args.after, args.before, args.pojedyncze, args.para, args.styl, args.miejsca))
+    saved_state = {}
+    if args.state and os.path.exists(args.state):
+        try:
+            with open(args.state) as f:
+                saved_state = json.load(f)
+        except Exception as e:
+            print(f"nie odczytałem stanu z {args.state}: {e} — zaczynam od zera")
+    meta = saved_state.get("__meta__", {}).get(gate_key, {})
+
+    if args.adaptacyjnie:
+        if not args.state:
+            sys.exit("--adaptacyjnie wymaga --state (inaczej nie wiem, kiedy było ostatnie sprawdzenie)")
+        # godzinę odjazdu znamy z poprzedniego przebiegu — decyzja "czy już czas"
+        # nie kosztuje ani jednego zapytania do API
+        if meta.get("departures"):
+            now = datetime.now()
+            # przy kilku pociągach liczy się najbliższy JESZCZE NIE odjechały —
+            # inaczej monitor zamknąłby się po pierwszym z nich
+            przyszle = sorted(d for d in meta["departures"]
+                              if datetime.fromisoformat(d) > now)
+            if not przyszle:
+                print("wszystkie monitorowane pociągi już odjechały — kończę monitoring")
+                return
+            dep = datetime.fromisoformat(przyszle[0])
+            if meta.get("last_check"):
+                nastepne = (datetime.fromisoformat(meta["last_check"])
+                            + timedelta(seconds=interval_for(dep, now)))
+                if now < nastepne:
+                    return  # cicho: nie czas jeszcze, żadnych zapytań
 
     from_h, from_e, from_name = resolve_station(args.src)
     to_h, to_e, to_name = resolve_station(args.dst)
@@ -435,14 +499,7 @@ def main():
                  + ("|pojedyncze" if args.pojedyncze else "")
                  + (f"|para-{args.styl}" if args.para else "")
                  + (f"|miejsca={args.miejsca}" if args.miejsca else ""))
-    saved_state, last_counts = {}, {}
-    if args.state and os.path.exists(args.state):
-        try:
-            with open(args.state) as f:
-                saved_state = json.load(f)
-            last_counts = saved_state.get(state_key, {})
-        except Exception as e:
-            print(f"nie odczytałem stanu z {args.state}: {e} — zaczynam od zera")
+    last_counts = saved_state.get(state_key, {})
     while True:
         stamp = datetime.now().strftime("%H:%M:%S")
         try:
@@ -455,7 +512,7 @@ def main():
                       "(stan bez zmian)")
                 if args.once:
                     break
-                time.sleep(args.interval)
+                time.sleep(pauza_do_nastepnego(args, meta))
                 continue
             matched = []
             for train in found:
@@ -487,6 +544,10 @@ def main():
                        format_push(args.date, newly), args.ntfy)
             if args.state:
                 saved_state[state_key] = last_counts
+                meta = {"last_check": datetime.now().isoformat(timespec="seconds")}
+                if matched:
+                    meta["departures"] = sorted(t["dataWyjazdu"].replace(" ", "T") for t in matched)
+                saved_state.setdefault("__meta__", {})[gate_key] = meta
                 with open(args.state, "w") as f:
                     json.dump(saved_state, f)
         except KeyboardInterrupt:
@@ -495,7 +556,7 @@ def main():
             print(f"[{stamp}] błąd: {e} (kolejna próba za {args.interval}s)")
         if args.once:
             break
-        time.sleep(args.interval)
+        time.sleep(pauza_do_nastepnego(args, meta))
 
 
 if __name__ == "__main__":
