@@ -158,7 +158,29 @@ Z `--adaptacyjnie` — wpis ustawiamy na **co minutę**, skrypt sam decyduje:
 * * * * * ~/pkp-monitor/pkp-monitor --from ... --adaptacyjnie --once --state ~/pkp-monitor/state.json >> ~/pkp-monitor/monitor.log 2>&1
 ```
 
-Progi: >48 h co 15 min, <48 h co 10 min, <24 h co 5 min, <3 h co 2 min.
+Progi bazowe: >48 h co 15 min, <48 h co 10 min, <24 h co 5 min, <3 h co 2 min.
+
+**Okno uwolnienia puli.** Na 24 h przed odjazdem pociągu z jego **stacji
+początkowej** (nie z naszej!) do ogólnej sprzedaży wracają miejsca blokowane
+dla osób starszych i z niepełnosprawnościami — jednorazowo duża pula. Wokół
+tego momentu `E = odjazd_ze_stacji_początkowej − 24 h` obowiązuje gęstszy
+harmonogram (zawsze brana jest wartość mniejsza z progiem bazowym):
+
+| okno | interwał |
+|---|---|
+| `E − 5 min` … `E + 15 min` | 1 min |
+| `E + 15 min` … `E + 2 h` | 2 min |
+| `E + 2 h` … `E + 4 h` | 5 min |
+
+Przy kilku monitorowanych pociągach obowiązuje **najgęstsze** tempo, jakiego
+chce którykolwiek z nich.
+
+Godziny odjazdu ze stacji początkowej pobierane są **raz** i zapamiętywane
+w `__meta__.trains[].origin`. Uwaga: `pobierzTrasePrzejazdu` w API intercity
+zwraca trasę dopiero **od stacji, o którą pytamy**, więc pełny bieg pociągu
+bierzemy z KOLEO (`api.koleo.pl/v2/main/connections` → `trains[].stops`,
+`position: 0` = stacja początkowa). KOLEO jest tu wyłącznie rozkładem jazdy —
+dostępność miejsc nadal czytamy z map GRM (patrz sekcja 10).
 Godziny odjazdu zapamiętywane są w `state.json` pod `__meta__`, dzięki czemu
 pominięty cykl kończy się w ~0,9 s **bez ani jednego zapytania do API**
 (bramka działa przed rozwiązaniem stacji i przed wypisaniem nagłówka).

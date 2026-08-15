@@ -21,6 +21,10 @@ które widać przy graficznym wyborze miejsca na intercity.pl.
 - **zagęszcza sprawdzanie przed odjazdem** (`--adaptacyjnie`): >48 h co 15 min,
   <48 h co 10 min, <24 h co 5 min, <3 h co 2 min — bo zwolnione miejsce
   w popularnym pociągu potrafi zniknąć w kilka minut,
+- w **oknie uwolnienia puli** — 24 h przed odjazdem pociągu z jego stacji
+  początkowej, gdy do sprzedaży wracają miejsca blokowane dla osób starszych
+  i z niepełnosprawnościami — schodzi na chwilę do **1 minuty**, potem 2 i 5,
+  zanim wróci do progów bazowych,
 - umie pilnować **konkretnych numerów miejsc** per wagon:
   `--miejsca "1:16,26,31;2:16,46"`,
 - powiadamia natywnie na macOS (dymek + dźwięk) oraz **push na telefon** przez

@@ -30,6 +30,7 @@ import re
 import subprocess
 import sys
 import time
+import unicodedata
 import xml.etree.ElementTree as ET
 from datetime import datetime, date, timedelta
 
@@ -199,27 +200,85 @@ def _by_wagon(pairs):
                      for wn, nrs in grouped.items())
 
 
-def interval_for(departure_dt, now):
+def interval_for(departure_dt, now, origin_dt=None):
     """Im bliżej odjazdu, tym częściej sprawdzamy — dobre miejsca z odwołanych
-    rezerwacji potrafią zniknąć w kilka minut."""
+    rezerwacji potrafią zniknąć w kilka minut.
+
+    Dodatkowo: na 24 h przed odjazdem pociągu z jego STACJI POCZĄTKOWEJ do
+    ogólnej puli wracają miejsca zablokowane dla osób starszych i z
+    niepełnosprawnościami. To jednorazowy zastrzyk dużej liczby miejsc, więc
+    wokół tego momentu sprawdzamy najgęściej, jak się da.
+    """
     hours = (departure_dt - now).total_seconds() / 3600
     if hours <= 3:
-        return 120
-    if hours <= 24:
-        return 300
-    if hours <= 48:
-        return 600
-    return 900
+        std = 120
+    elif hours <= 24:
+        std = 300
+    elif hours <= 48:
+        std = 600
+    else:
+        std = 900
+
+    if origin_dt:
+        # E = moment uwolnienia puli
+        od_E = (now - (origin_dt - timedelta(hours=24))).total_seconds()
+        if -5 * 60 <= od_E < 15 * 60:
+            return min(std, 60)       # okno uwolnienia: co minutę
+        if 15 * 60 <= od_E < 2 * 3600:
+            return min(std, 120)      # tuż po: co 2 minuty
+        if 2 * 3600 <= od_E < 4 * 3600:
+            return min(std, 300)      # dogrywka: co 5 minut
+    return std
+
+
+def koleo_origin_departures(date_iso, from_name, to_name, od_godziny="00:01"):
+    """Godziny odjazdu pociągów z ICH stacji początkowej: {nr_pociagu: iso}.
+
+    API intercity zwraca trasę dopiero od stacji, o którą pytamy, więc pełny
+    bieg pociągu bierzemy z KOLEO (`stops[0]`, pozycja 0 = stacja początkowa).
+    KOLEO służy tu wyłącznie za rozkład jazdy — dostępność miejsc nadal
+    czytamy z map GRM, bo KOLEO nie odróżnia miejsc siedzących od stojących.
+    """
+    def slug(name):
+        s = unicodedata.normalize("NFKD", name.lower()).replace("ł", "l")
+        return "-".join("".join(c for c in s if not unicodedata.combining(c)).split())
+
+    # KOLEO oddaje tylko kilkanaście połączeń od podanej godziny, więc pytamy
+    # od momentu tuż przed interesującym nas pociągiem, a nie od północy
+    d, m_, y = date_iso[8:10], date_iso[5:7], date_iso[:4]
+    params = {"query[date]": f"{d}-{m_}-{y} {od_godziny}:00", "query[start_station]": slug(from_name),
+              "query[end_station]": slug(to_name), "query[only_direct]": "true"}
+    r = requests.get("https://api.koleo.pl/v2/main/connections", params=params,
+                     headers={"x-koleo-version": "2", "x-koleo-client": "Nuxt-1",
+                              "User-Agent": "Mozilla/5.0"},
+                     impersonate="chrome", timeout=30)
+    out = {}
+    for c in (r.json() or {}).get("connections", []):
+        for t in c.get("trains") or []:
+            stops = sorted(t.get("stops") or [], key=lambda s: s.get("position", 0))
+            if stops and stops[0].get("departure"):
+                out[str(t.get("train_nr"))] = stops[0]["departure"][:19]
+    return out
 
 
 def pauza_do_nastepnego(args, meta):
     """Ile spać w trybie pętli (w cronie nieużywane — tam decyduje --adaptacyjnie)."""
     now = datetime.now()
-    przyszle = sorted(d for d in (meta.get("departures") or [])
-                      if datetime.fromisoformat(d) > now)
+    przyszle = przyszle_pociagi(meta, now)
     if args.adaptacyjnie and przyszle:
-        return interval_for(datetime.fromisoformat(przyszle[0]), now)
+        return min(interval_for(dep, now, org) for dep, org in przyszle)
     return args.interval
+
+
+def przyszle_pociagi(meta, now):
+    """[(odjazd z mojej stacji, odjazd ze stacji początkowej|None), ...]
+    dla pociągów, które jeszcze nie odjechały."""
+    out = []
+    for t in meta.get("trains") or []:
+        dep = datetime.fromisoformat(t["departure"])
+        if dep > now:
+            out.append((dep, datetime.fromisoformat(t["origin"]) if t.get("origin") else None))
+    return sorted(out)
 
 
 def parse_miejsca(spec):
@@ -450,19 +509,18 @@ def main():
             sys.exit("--adaptacyjnie wymaga --state (inaczej nie wiem, kiedy było ostatnie sprawdzenie)")
         # godzinę odjazdu znamy z poprzedniego przebiegu — decyzja "czy już czas"
         # nie kosztuje ani jednego zapytania do API
-        if meta.get("departures"):
+        if meta.get("trains"):
             now = datetime.now()
             # przy kilku pociągach liczy się najbliższy JESZCZE NIE odjechały —
             # inaczej monitor zamknąłby się po pierwszym z nich
-            przyszle = sorted(d for d in meta["departures"]
-                              if datetime.fromisoformat(d) > now)
+            przyszle = przyszle_pociagi(meta, now)
             if not przyszle:
                 print("wszystkie monitorowane pociągi już odjechały — kończę monitoring")
                 return
-            dep = datetime.fromisoformat(przyszle[0])
             if meta.get("last_check"):
-                nastepne = (datetime.fromisoformat(meta["last_check"])
-                            + timedelta(seconds=interval_for(dep, now)))
+                # najgęstsze tempo, jakiego chce którykolwiek z pociągów
+                odstep = min(interval_for(dep, now, org) for dep, org in przyszle)
+                nastepne = datetime.fromisoformat(meta["last_check"]) + timedelta(seconds=odstep)
                 if now < nastepne:
                     return  # cicho: nie czas jeszcze, żadnych zapytań
 
@@ -544,9 +602,27 @@ def main():
                        format_push(args.date, newly), args.ntfy)
             if args.state:
                 saved_state[state_key] = last_counts
-                meta = {"last_check": datetime.now().isoformat(timespec="seconds")}
+                nowe_meta = {"last_check": datetime.now().isoformat(timespec="seconds")}
                 if matched:
-                    meta["departures"] = sorted(t["dataWyjazdu"].replace(" ", "T") for t in matched)
+                    # godziny odjazdu ze stacji początkowej pobieramy raz i pamiętamy —
+                    # rozkład się nie zmienia, a to dodatkowe zapytanie na cykl
+                    znane = {t["nr"]: t.get("origin") for t in (meta.get("trains") or [])}
+                    numery = {str(t["pociagi"][0]["nrPociagu"]) for t in matched}
+                    if args.adaptacyjnie and not all(znane.get(n) for n in numery):
+                        naj = min(t["dataWyjazdu"] for t in matched)[11:16]
+                        od = (datetime.strptime(naj, "%H:%M") - timedelta(minutes=90))
+                        try:
+                            znane.update(koleo_origin_departures(
+                                args.date, from_name, to_name,
+                                od.strftime("%H:%M") if od.hour or od.minute else "00:01"))
+                        except Exception as e:
+                            print(f"  (nie ustaliłem odjazdów ze stacji początkowych: {e})")
+                    nowe_meta["trains"] = [
+                        {"nr": str(t["pociagi"][0]["nrPociagu"]),
+                         "departure": t["dataWyjazdu"].replace(" ", "T"),
+                         "origin": znane.get(str(t["pociagi"][0]["nrPociagu"]))}
+                        for t in matched]
+                meta = nowe_meta
                 saved_state.setdefault("__meta__", {})[gate_key] = meta
                 with open(args.state, "w") as f:
                     json.dump(saved_state, f)
