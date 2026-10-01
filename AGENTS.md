@@ -127,6 +127,12 @@ Jeśli po zmianach w parserze te liczby się nie zgadzają — regresja.
   - `obok-bez-stolika` — obok siebie, nikt naprzeciwko,
   - `pojedyncze-stolik` — dwa **pojedyncze** zwrócone do siebie przez stolik,
   - `preferowany` — dwa powyższe łącznie,
+- `--trzy` — trzy miejsca dla trzech osób razem: co najmniej 3 z 4 foteli wokół
+  jednego stolika albo jeden rząd (to samo `x`) po obu stronach korytarza.
+  Kolumny bez foteli po drugiej stronie korytarza (przedziały w wagonach `MIXED`,
+  narysowane na `y = 0/40/80` w mapach wysokich na 160 px) są pomijane — dlatego
+  strona przejścia liczona jest od środka mapy, a fotel na `y = 80` w takiej mapie
+  dostaje `side = "m"`,
 - `--miejsca "1:16,26,31;2:16,46"` — konkretne numery per wagon (ma pierwszeństwo),
 - filtry: `--train`, `--klasa`, `--wagon`, `--after`, `--before`.
 

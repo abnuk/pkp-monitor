@@ -18,6 +18,9 @@ które widać przy graficznym wyborze miejsca na intercity.pl.
 - znajduje **miejsca dla dwóch osób razem** (`--para`) z rozróżnieniem układu
   (`--styl`): `obok-bez-stolika`, `pojedyncze-stolik` (dwa pojedyncze naprzeciw
   siebie przez stolik), `preferowany` (oba naraz) albo `dowolny`,
+- znajduje **miejsca dla trzech osób** (`--trzy`): trzy fotele wokół jednego
+  stolika albo jeden rząd po obu stronach korytarza (przedziały w wagonach
+  mieszanych są pomijane),
 - **zagęszcza sprawdzanie przed odjazdem** (`--adaptacyjnie`): >48 h co 15 min,
   <48 h co 10 min, <24 h co 5 min, <3 h co 2 min — bo zwolnione miejsce
   w popularnym pociągu potrafi zniknąć w kilka minut,

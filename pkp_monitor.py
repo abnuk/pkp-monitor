@@ -123,8 +123,19 @@ def parse_wagon_seats(svg_text):
             "y": int(float(img.get("y") or 0)),
             "ori": "R" if "R.png" in href else ("L" if "L.png" in href else "?"),
         })
+    # korytarz biegnie środkiem mapy: w wagonach 0..120 (np. 1313) między y=40 a 80,
+    # w wysokich 0..160 między 40 a 120 — fotel na y=80 to tam przedział albo
+    # nietypowe miejsce na końcu wagonu ("m" = ani po jednej, ani po drugiej stronie)
+    mid = (max((s["y"] for s in seats), default=0) + 40) / 2
     for s in seats:
-        s["side"] = "t" if s["y"] < 60 else "b"
+        s["side"] = "t" if s["y"] + 40 <= mid else ("b" if s["y"] >= mid else "m")
+    # kolumna "otwarta" = fotele po obu stronach korytarza i nic pośrodku;
+    # przedziały w wagonach mieszanych mają fotele tylko po jednej stronie
+    sides_at = {}
+    for s in seats:
+        sides_at.setdefault(s["x"], set()).add(s["side"])
+    for s in seats:
+        s["open"] = sides_at[s["x"]] == {"t", "b"}
     for s in seats:
         s["single"] = not any(o["side"] == s["side"] and o["x"] == s["x"] and o["y"] != s["y"]
                               for o in seats if o is not s)
@@ -132,14 +143,17 @@ def parse_wagon_seats(svg_text):
                      key=lambda o: o["x"])
         i = row.index(s)
         s["faces"] = None  # numer miejsca naprzeciwko (przez stolik), jeśli jest
+        s["table"] = None  # id stolika: strona + x fotela "R" przy nim
         if s["ori"] == "R" and i + 1 < len(row):
             nxt = row[i + 1]
             if nxt["ori"] == "L" and nxt["x"] - s["x"] <= 120:
                 s["faces"] = nxt["nr"]
+                s["table"] = f"{s['side']}{s['x']}"
         elif s["ori"] == "L" and i > 0:
             prv = row[i - 1]
             if prv["ori"] == "R" and s["x"] - prv["x"] <= 120:
                 s["faces"] = prv["nr"]
+                s["table"] = f"{s['side']}{prv['x']}"
         s["facing"] = s["faces"] is not None
     return seats
 
@@ -332,8 +346,38 @@ def find_pairs(pool, styl="dowolny"):
     return sorted(out, key=lambda p: (p[0]["nr"], p[1][0]["y"], p[1][0]["x"]))
 
 
+def find_triples(pool):
+    """Trzy wolne miejsca dla trzech osób razem. Zwraca [(wagon, [miejsca], opis), ...].
+
+    Rozpoznawane układy:
+      * przy stoliku — co najmniej trzy z czterech foteli wokół jednego stolika
+        (dwa obok siebie + naprzeciwko),
+      * jeden rząd przez korytarz — to samo x po obu stronach przejścia
+        (w kl.1 2+1 to cały rząd, w kl.2 2+2 trzy z czterech).
+
+    Przedziały w wagonach mieszanych są pomijane (kolumny bez drugiej strony korytarza).
+    """
+    out = []
+    stoliki, rzedy = {}, {}
+    for w, s in pool:
+        if not s["open"]:
+            continue
+        if s["table"]:
+            stoliki.setdefault((w["nr"], s["table"]), (w, []))[1].append(s)
+        rzedy.setdefault((w["nr"], s["x"]), (w, []))[1].append(s)
+    for w, seats in stoliki.values():
+        if len(seats) >= 3:
+            out.append((w, sorted(seats, key=lambda o: (o["x"], o["y"])), "przy stoliku"))
+    for w, seats in rzedy.values():
+        if len(seats) >= 3:
+            stolik = any(s["facing"] for s in seats)
+            out.append((w, sorted(seats, key=lambda o: o["y"]),
+                        "rząd przez korytarz" + (", przy stolikach" if stolik else ", bez stolika")))
+    return sorted(out, key=lambda p: (p[0]["nr"], min(s["x"] for s in p[1])))
+
+
 def summarize(wagons, skipped, klasa, wagon_want, single_only=False, wishlist=None,
-              pairs_only=False, styl="dowolny"):
+              pairs_only=False, styl="dowolny", trzy=False):
     """Zwraca (liczba miejsc wyzwalających powiadomienie, tekst podsumowania)."""
     total, parts = 0, []
     for cls in ("1", "2") if klasa == "any" else (klasa,):
@@ -343,17 +387,21 @@ def summarize(wagons, skipped, klasa, wagon_want, single_only=False, wishlist=No
                 continue
             spec += w[f"kl{cls}_spec"]
             pool += [(w, s) for s in w[f"kl{cls}"]]
-        if pairs_only:
-            pairs = find_pairs(pool, styl)
+        if pairs_only or trzy:
+            pairs = find_triples(pool) if trzy else find_pairs(pool, styl)
             total += len(pairs)
-            etykieta = "pary dla dwóch osób" if styl != "dowolny" else "pary obok siebie"
+            if trzy:
+                etykieta = "miejsca dla trzech osób"
+            else:
+                etykieta = "pary dla dwóch osób" if styl != "dowolny" else "pary obok siebie"
             s_txt = f"kl.{cls} {etykieta}: {len(pairs)}"
             if pairs:
                 s_txt += " — " + ", ".join(
                     f"wag.{w['nr']}: {'+'.join(s['nr'] for s in seats)}"
-                    + (f" ({opis})" if styl != "dowolny" else "")
+                    + (f" ({opis})" if trzy or styl != "dowolny" else "")
                     for w, seats, opis in pairs[:6]) + ("…" if len(pairs) > 6 else "")
-            singles = len(pool) - sum(len(seats) for _, seats, _ in pairs)
+            # układy trójek mogą dzielić miejsca (stolik i rząd), więc liczymy unikalne
+            singles = len(pool) - len({(w["nr"], s["nr"]) for w, seats, _ in pairs for s in seats})
             if singles:
                 s_txt += f"; innych wolnych: {singles}"
             if spec:
@@ -464,6 +512,9 @@ def main():
                    help="jakie układy pary akceptujesz (z --para): dowolny = każde dwa obok "
                         "siebie; obok-bez-stolika; pojedyncze-stolik = dwa miejsca pojedyncze "
                         "naprzeciw siebie przez stolik; preferowany = dwa ostatnie razem")
+    p.add_argument("--trzy", action="store_true",
+                   help="powiadamiaj tylko gdy są trzy wolne miejsca dla trzech osób razem: "
+                        "wokół jednego stolika albo w jednym rzędzie przez korytarz")
     p.add_argument("--miejsca", default=None, metavar="LISTA",
                    help='powiadamiaj tylko o konkretnych miejscach, per wagon: "1:16,26,31;2:16,46" '
                         "(ma pierwszeństwo przed --pojedyncze)")
@@ -482,6 +533,8 @@ def main():
                    help="plik stanu między uruchomieniami (ważne pod crona z --once, "
                         "żeby nie powiadamiał w kółko o tych samych miejscach)")
     args = p.parse_args()
+    if args.para and args.trzy:
+        sys.exit("--para i --trzy wykluczają się — wybierz jedno")
     trains_filter = {t.strip() for t in args.train.split(",")} if args.train else None
 
     if date.fromisoformat(args.date) < date.today():
@@ -494,7 +547,7 @@ def main():
     # i zaśmiecał log. Dlatego klucz liczymy z surowych argumentów.
     gate_key = "|".join(str(x) for x in (
         args.src, args.dst, args.date, args.train, args.klasa, args.wagon,
-        args.after, args.before, args.pojedyncze, args.para, args.styl, args.miejsca))
+        args.after, args.before, args.pojedyncze, args.para, args.styl, args.miejsca)) + ("|trzy" if args.trzy else "")
     saved_state = {}
     if args.state and os.path.exists(args.state):
         try:
@@ -556,6 +609,7 @@ def main():
                  + f"|{args.after}-{args.before}"
                  + ("|pojedyncze" if args.pojedyncze else "")
                  + (f"|para-{args.styl}" if args.para else "")
+                 + ("|trzy" if args.trzy else "")
                  + (f"|miejsca={args.miejsca}" if args.miejsca else ""))
     last_counts = saved_state.get(state_key, {})
     while True:
@@ -592,7 +646,7 @@ def main():
                 wagons, skipped = check_seats(train, from_e, to_e)
                 free, summary = summarize(wagons, skipped, args.klasa, args.wagon,
                                           single_only=args.pojedyncze, wishlist=wishlist,
-                                          pairs_only=args.para, styl=args.styl)
+                                          pairs_only=args.para, styl=args.styl, trzy=args.trzy)
                 print(f"[{stamp}] {desc}: {summary}")
                 if free > 0 and not last_counts.get(nr):
                     newly.append((desc, summary))
@@ -631,6 +685,9 @@ def main():
         except Exception as e:
             print(f"[{stamp}] błąd: {e} (kolejna próba za {args.interval}s)")
         if args.once:
+            break
+        if meta.get("trains") and not przyszle_pociagi(meta, datetime.now()):
+            print("wszystkie monitorowane pociągi już odjechały — kończę monitoring")
             break
         time.sleep(pauza_do_nastepnego(args, meta))
 
